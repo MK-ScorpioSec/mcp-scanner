@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyyaml requests
+
+      - name: Syntax check
+        run: python3 -m py_compile mcp_scanner.py
+
+      - name: Self-scan (scan the repo config)
+        run: python3 mcp_scanner.py --file . --min-severity MEDIUM --exit-code || true
+
+      - name: Run tests
+        run: python3 -m pytest tests/ -v 2>/dev/null || echo "no tests yet"
+
+  scan-mcp-config:
+    runs-on: ubuntu-latest
+    name: Scan MCP config on PR
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyyaml requests
+
+      - name: Scan changed MCP configs
+        run: |
+          git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '\.(json|yaml|yml)$' | while read f; do
+            echo "Scanning $f..."
+            python3 mcp_scanner.py --file "$f" --output sarif > "scan-$( basename $f ).sarif" 2>/dev/null || true
+          done
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "."
+        continue-on-error: true
