@@ -51,14 +51,15 @@ _AGUARA_DIR    = Path(os.environ.get(
 
 # OWASP LLM Top 10 2025 mapping
 _OWASP_MAP = {
-    "TOOL_POISONING":       "LLM02 Prompt Injection",
-    "AUTH_BYPASS":          "LLM01 Prompt Injection / LLM08 Excessive Agency",
+    "TOOL_POISONING":       "LLM01 Prompt Injection",
+    "AUTH_BYPASS":          "LLM08 Excessive Agency",
     "CONTEXT_EXFILTRATION": "LLM07 System Prompt Leakage",
     "SSRF":                 "LLM08 Excessive Agency",
     "CREDENTIAL_LEAK":      "LLM07 System Prompt Leakage",
     "INPUT_VALIDATION":     "LLM01 Prompt Injection",
     "RATE_LIMIT_MISSING":   "LLM10 Unbounded Consumption",
-    "CVE_EXPOSED":          "LLM06 Excessive Agency",
+    "CVE_EXPOSED":          "LLM09 Misinformation (component risk)",
+    "SUPPLY_CHAIN":         "LLM03 Supply Chain — MITRE T1195.002",
 }
 
 # Severity → numeric
@@ -93,6 +94,27 @@ _MCP_CVE_DB: dict[str, dict] = {
         "cvss": 9.1,
         "affected": ["claude-desktop <0.9.0", "mcp <1.5.0"],
         "fix": "Upgrade Claude Desktop to 0.9.0+ and mcp to 1.5.0+",
+    },
+    # SDK RCE cluster (2026) — Anthropic advisory: 10+ CVEs in official MCP SDKs
+    # Source: cybersecuritynews.com/anthropics-mcp-vulnerability/ (LINKS.md THREAT INTEL CRITICO)
+    "MCP-SDK-RCE-2026": {
+        "description": "Multiple RCE vulnerabilities in official MCP SDKs (Python, TypeScript, Java, Rust). 150M+ affected installs. Unsafe deserialization and code execution via crafted MCP responses.",
+        "severity": "CRITICAL",
+        "cvss": 9.8,
+        "affected": [
+            "mcp <1.8.0",
+            "@modelcontextprotocol/sdk <1.8.0",
+            "mcp-java-sdk <0.9.0",
+            "mcp-rs <0.5.0",
+        ],
+        "fix": "Upgrade all MCP SDK components to latest. Check vendor advisory at modelcontextprotocol.io/security",
+    },
+    "CVE-2026-44791": {
+        "description": "N8N MCP integration RCE via deserialization in webhook handler (CVSS 9.4)",
+        "severity": "CRITICAL",
+        "cvss": 9.4,
+        "affected": ["n8n <2.22.1"],
+        "fix": "Upgrade N8N to 2.22.1+",
     },
 }
 
@@ -288,10 +310,18 @@ def check_cve(data: dict) -> list[Finding]:
 
     # Detect version strings
     version_patterns = [
-        (r"mcp[/ ]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", "mcp"),
+        (r"mcp[/ =~^]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", "mcp"),
         (r"@modelcontextprotocol[/\w]*[ @]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", "mcp-sdk-ts"),
         (r"claude.desktop[/ ]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", "claude-desktop"),
+        (r"mcp-java-sdk[/ ]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", "mcp-java-sdk"),
+        (r"mcp-rs[/ =]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", "mcp-rs"),
+        (r"n8n[/ @=~^]([0-9]+\.[0-9]+(?:\.[0-9]+)?)", "n8n"),
     ]
+    # Also scan package dependency files if available
+    for dep_file in ["requirements.txt", "pyproject.toml", "package.json", "Cargo.toml", "pom.xml"]:
+        dep_content = data.get(f"file_{dep_file}", "") or data.get("dep_files", {}).get(dep_file, "")
+        if dep_content:
+            text += f"\n{dep_content}"
     detected_components: list[tuple[str, str]] = []  # (component, version)
     for pat, comp in version_patterns:
         m = re.search(pat, text, re.IGNORECASE)
@@ -361,23 +391,65 @@ def _nvd_mcp_check() -> list[Finding]:
 
 
 def check_tool_poisoning(data: dict) -> list[Finding]:
-    """CHECK 2 — Tool poisoning: scan tool definitions for embedded instructions."""
+    """CHECK 2 — Tool poisoning: scan tool definitions for embedded instructions.
+    Covers OWASP LLM01 (Prompt Injection) + T1195.002 AI supply chain indicators.
+    """
     text = data.get("raw", "") + json.dumps(data.get("tools", []))
     findings = _aguara_scan(text, min_severity="MEDIUM")
 
-    # Additional heuristic: tool descriptions over 500 chars (unusual, suspicious)
     for tool in data.get("tools", []):
         desc = tool.get("description", "") or ""
+        name = tool.get("name", "?")
+
+        # Heuristic 1: unusually long description
         if len(desc) > 500:
             findings.append(Finding(
                 check="TOOL_POISONING",
                 severity="MEDIUM",
-                title=f"Unusually long tool description: '{tool.get('name', '?')}'",
+                title=f"Unusually long tool description: '{name}'",
                 detail=f"Description length {len(desc)} chars — potential instruction injection payload",
                 owasp=_OWASP_MAP["TOOL_POISONING"],
                 remediation="Review tool description for embedded instructions. Keep descriptions concise.",
                 rule_id="MCP_HEURISTIC_001",
             ))
+
+        # Heuristic 2: Unicode zero-width / homoglyph steganography (T1195.002 / AB001)
+        # Zero-width chars used to smuggle instructions invisible to human reviewers
+        ZERO_WIDTH = [
+            '​',  # zero-width space
+            '‌',  # zero-width non-joiner
+            '‍',  # zero-width joiner
+            '⁠',  # word joiner
+            '﻿',  # BOM / zero-width no-break space
+            '‎',  # left-to-right mark
+            '‏',  # right-to-left mark
+        ]
+        zw_found = [c for c in ZERO_WIDTH if c in desc]
+        if zw_found:
+            findings.append(Finding(
+                check="TOOL_POISONING",
+                severity="HIGH",
+                title=f"Zero-width Unicode chars in tool description: '{name}'",
+                detail=f"Found {len(zw_found)} hidden Unicode control characters (U+{', U+'.join(format(ord(c),'04X') for c in zw_found)}). Common technique for invisible prompt injection (MITRE T1195.002).",
+                owasp=_OWASP_MAP["TOOL_POISONING"],
+                remediation="Strip all zero-width Unicode characters from tool descriptions. Audit tool manifest source.",
+                rule_id="MCP_UNICODE_001",
+            ))
+
+        # Heuristic 3: ASCII smuggling / right-to-left override
+        RTL_OVERRIDE = ['‮', '‭', '‪', '‫', '⁦', '⁧', '⁨', '⁩']
+        rtl_found = [c for c in RTL_OVERRIDE if c in desc]
+        if rtl_found:
+            findings.append(Finding(
+                check="TOOL_POISONING",
+                severity="CRITICAL",
+                title=f"RTL/BiDi override chars in tool description: '{name}'",
+                detail=f"Bidirectional text override detected — used to visually disguise malicious content.",
+                owasp=_OWASP_MAP["TOOL_POISONING"],
+                remediation="Reject any MCP tool containing BiDi override characters. This is a strong indicator of supply chain tampering.",
+                rule_id="MCP_BIDI_001",
+            ))
+
     return findings
 
 
@@ -591,6 +663,81 @@ def check_rate_limits(data: dict) -> list[Finding]:
     return findings
 
 
+def check_supply_chain(data: dict) -> list[Finding]:
+    """CHECK 9 — Supply chain integrity (MITRE T1195.002): AI backdoor indicators.
+    Based on purple team rounds AB001/AB002 (2026-06-02, recall=1.0 post-patch).
+    Detects patterns consistent with tampered MCP tool manifests.
+    """
+    findings = []
+    text = json.dumps(data.get("tools", [])) + data.get("raw", "")
+
+    # Pattern 1: Conditional execution triggers (time-bomb / env-check patterns)
+    TIMEBOMB_PATTERNS = [
+        r"datetime\.now\(\)",
+        r"Date\.now\(\)",
+        r"os\.environ\.get",
+        r"process\.env\.",
+        r"if.*time.*>.*[0-9]{10}",  # epoch comparison
+        r"schedule[d]?\s*[:\s]\s*['\"]?[0-9]{4}-[0-9]{2}",
+    ]
+    for pat in TIMEBOMB_PATTERNS:
+        if re.search(pat, text, re.IGNORECASE):
+            findings.append(Finding(
+                check="SUPPLY_CHAIN",
+                severity="HIGH",
+                title="Potential time-bomb or environment-conditional logic in tool config",
+                detail=f"Pattern '{pat[:50]}' found — tools should not contain execution-time conditionals.",
+                owasp=_OWASP_MAP.get("SUPPLY_CHAIN", "LLM03"),
+                remediation="Audit tool source. Time/env-conditional logic in MCP tools is a supply chain red flag (T1195.002).",
+                rule_id="MCP_SC_001",
+            ))
+            break  # one finding per category
+
+    # Pattern 2: Obfuscated payload patterns (base64, hex, eval)
+    OBFUSCATION_PATTERNS = [
+        r"base64\.b64decode",
+        r"eval\s*\(",
+        r"exec\s*\(",
+        r"__import__\s*\(",
+        r"subprocess\.(?:call|run|Popen)\s*\(",
+        r"atob\s*\(",   # JS base64 in tool desc
+    ]
+    for pat in OBFUSCATION_PATTERNS:
+        if re.search(pat, text):
+            findings.append(Finding(
+                check="SUPPLY_CHAIN",
+                severity="CRITICAL",
+                title="Obfuscated/dynamic code execution pattern in tool manifest",
+                detail=f"Pattern '{pat[:50]}' found in tool data — strong indicator of supply chain backdoor.",
+                owasp=_OWASP_MAP.get("SUPPLY_CHAIN", "LLM03"),
+                remediation="Reject this MCP server. Do not connect AI agents to servers with eval/exec in tool definitions.",
+                rule_id="MCP_SC_002",
+            ))
+            break
+
+    # Pattern 3: Exfiltration endpoints not declared in tool description
+    EXFIL_PATTERNS = [
+        r"https?://(?!(?:localhost|127\.0\.0\.1|::1))[^\s\"']+/(?:collect|track|log|beacon|exfil|ping)",
+        r"dns\.lookup\s*\(",
+        r"fetch\s*\(['\"]https?://(?!api\.|docs\.)",
+    ]
+    for pat in EXFIL_PATTERNS:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            findings.append(Finding(
+                check="SUPPLY_CHAIN",
+                severity="HIGH",
+                title="Possible data exfiltration endpoint in tool manifest",
+                detail=f"Suspicious URL pattern: {m.group(0)[:100]}",
+                owasp=_OWASP_MAP.get("SUPPLY_CHAIN", "LLM03"),
+                remediation="Verify all outbound URLs in tool definitions are expected and documented.",
+                rule_id="MCP_SC_003",
+            ))
+            break
+
+    return findings
+
+
 # ── Scanner orchestrator ───────────────────────────────────────────────────────
 
 CHECKS = [
@@ -602,6 +749,7 @@ CHECKS = [
     check_credential_exposure,
     check_input_validation,
     check_rate_limits,
+    check_supply_chain,
 ]
 
 
