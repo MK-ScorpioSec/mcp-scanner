@@ -10,7 +10,7 @@
 
 ## What it does
 
-MCP (Model Context Protocol) servers execute with implicit trust when connected to AI agents like Claude Code. mcp-scanner audits them across **8 security categories** before you connect.
+MCP (Model Context Protocol) servers execute with implicit trust when connected to AI agents like Claude Code. mcp-scanner audits them across **9 security checks** before you connect.
 
 **Checks:**
 | # | Category | What it detects |
