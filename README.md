@@ -1,5 +1,10 @@
 # mcp-scanner — MCP Server Security Scanner
 
+<p align="center">
+<img src="assets/banner.png" alt="mcp-scanner — MCP Server Security Scanner. 9 security checks, OWASP LLM Top 10. Banner generated with AI assistance." width="100%" />
+<br><sub>Banner generated with AI assistance · MK ScorpioSec</sub>
+</p>
+
 > Audit Model Context Protocol (MCP) servers for vulnerabilities before connecting AI agents.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -63,6 +68,8 @@ python3 mcp_scanner.py --target http://server:3000 --exit-code
 ```
 
 ## Example Output
+
+![mcp-scanner demo](assets/demo.gif)
 
 ```
 [mcp-scanner] Scanning: http://mcp-server:3000
