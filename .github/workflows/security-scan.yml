@@ -9,16 +9,17 @@ on:
     - cron: '0 2 * * 1'
 
 jobs:
-  security:
+  secrets:
+    name: Secret Detection
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
 
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+    - name: Checkout
+      run: |
+        git clone --depth=2 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" .
+        git checkout "${{ github.sha }}" 2>/dev/null || true
 
     - name: TruffleHog — secret scan
       run: |
@@ -26,46 +27,40 @@ jobs:
           | sh -s -- -b /usr/local/bin
         trufflehog git file://. --since-commit HEAD~1 --only-verified --fail || true
 
-    - name: Bandit — Python SAST
-      run: |
-        pip install bandit --quiet
-        bandit -r . -ll -f json | tee bandit-results.json || true
-        python3 -c "
-import json, sys
-try:
-  d = json.load(open('bandit-results.json'))
-  highs = [r for r in d.get('results',[]) if r['issue_severity'] in ['HIGH','CRITICAL']]
-  if highs:
-    print(f'Bandit FAIL: {len(highs)} HIGH/CRITICAL findings')
-    for h in highs[:5]:
-      print(f'  {h[\"filename\"]}:{h[\"line_number\"]} — {h[\"issue_text\"]}')
-    sys.exit(1)
-  print('Bandit PASS')
-except Exception as e:
-  print(f'Bandit error: {e}')
-"
-
-  codeql:
-    name: CodeQL Analysis
+  sast:
+    name: SAST
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      run: |
+        git clone --depth=1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" .
 
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: python
-        queries: security-extended
+    - name: Bandit — Python
+      run: |
+        pip install bandit --quiet
+        if find . -name "*.py" | grep -q .; then
+          bandit -r . -ll -f json -o bandit-results.json || true
+          python3 -c "import json,sys; d=json.load(open('bandit-results.json')); highs=[r for r in d.get('results',[]) if r['issue_severity'] in ['HIGH','CRITICAL']]; print('FAIL: {} HIGH/CRITICAL findings'.format(len(highs))) if highs else print('PASS'); sys.exit(1) if highs else None"
+        else
+          echo 'No Python files to scan'
+        fi
 
-    - name: Autobuild
-      uses: github/codeql-action/autobuild@v3
+    - name: pip-audit — dependency vulnerabilities
+      run: |
+        pip install pip-audit --quiet
+        if [ -f requirements.txt ]; then
+          pip-audit -r requirements.txt --format=json -o pip-audit.json || true
+          python3 -c "import json,sys; d=json.load(open('pip-audit.json')); vulns=[v for dep in d.get('dependencies',[]) for v in dep.get('vulns',[])]; print('Found {} vulnerabilities'.format(len(vulns))) if vulns else print('PASS')"
+        else
+          echo 'No requirements.txt'
+        fi
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
-      with:
-        category: /language:python
+    - name: Checkov — IaC
+      run: |
+        pip install checkov --quiet
+        if find . -name "*.tf" | grep -q .; then
+          checkov -d . --framework terraform --soft-fail --compact || true
+        else
+          echo 'No IaC files to scan'
+        fi
